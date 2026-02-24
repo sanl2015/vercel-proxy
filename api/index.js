@@ -101,7 +101,7 @@ export default async function handler(request) {
                     }
                 } catch(e) {}
             }
-            return new Response("⚠️ 代理请求解析失败：缺少目标域名", { status: 400 });
+            return new Response("⚠️ 代理请求解析失败：缺少目标域名。请确保从网关首页发起访问，或检查原网页资源相对路径。", { status: 400 });
         }
     }
     
@@ -172,13 +172,14 @@ export default async function handler(request) {
             resHeaders.set("Cache-Control", "public, max-age=2592000");
         }
 
-        // Vercel 环境下使用正则替换 HTMLRewriter 的逻辑
+        // --- 深度重构的 HTML 资源代理改写逻辑 ---
         if (contentType.includes("text/html")) {
             let bodyText = await response.text();
             const proxyBase = `https://${url.host}/`;
             
-            // 注入 AJAX / Fetch 劫持脚本
+            // 注入 meta referrer 标签强制浏览器发送来源，并增强 Fetch/XHR 及 DOM 劫持
             const scriptToInject = `
+            <meta name="referrer" content="same-origin">
             <script>
             (function() {
                 const proxyBase = window.location.origin + "/";
@@ -186,29 +187,56 @@ export default async function handler(request) {
                 const wrap = (u) => {
                     if (!u || typeof u !== 'string' || u.startsWith('data:') || u.startsWith('javascript:') || u.startsWith('#')) return u;
                     try {
+                        if (u.startsWith(proxyBase)) return u;
                         const abs = new URL(u, targetOrigin).href;
                         if (!abs.startsWith(proxyBase)) return proxyBase + abs;
                     } catch(e) {}
                     return u;
                 };
-                window.fetch = (i, init) => window.fetch(wrap(i), init);
+                
+                const _fetch = window.fetch;
+                window.fetch = (i, init) => {
+                    if (typeof i === 'string') i = wrap(i);
+                    else if (i instanceof Request) {
+                        try { i = new Request(wrap(i.url), i); } catch(e){}
+                    }
+                    return _fetch(i, init);
+                };
+                
                 const _open = XMLHttpRequest.prototype.open;
                 XMLHttpRequest.prototype.open = function() {
                     arguments[1] = wrap(arguments[1]);
                     return _open.apply(this, arguments);
                 };
+                
+                const observer = new MutationObserver((mutations) => {
+                    mutations.forEach((mutation) => {
+                        mutation.addedNodes.forEach((node) => {
+                            if (node.tagName) {
+                                ['src', 'href', 'action'].forEach(attr => {
+                                    if (node.hasAttribute(attr)) {
+                                        node.setAttribute(attr, wrap(node.getAttribute(attr)));
+                                    }
+                                });
+                            }
+                        });
+                    });
+                });
+                // 仅当 document.body 存在时才开始监听，防止 head 内部署报错
+                document.addEventListener("DOMContentLoaded", () => {
+                    observer.observe(document.documentElement, { childList: true, subtree: true });
+                });
             })();
             </script>`;
 
-            // 暴力注入 head
+            // 注入脚本到 head
             bodyText = bodyText.replace(/<head[^>]*>/i, `$&${scriptToInject}`);
 
-            // 正则改写 a, form, link, img, script 标签
-            bodyText = bodyText.replace(/<(a|form|link|img|script)\s+([^>]*?)(href|action|src)\s*=\s*(['"])(.*?)\4([^>]*?)>/gi, (match, tag, before, attr, quote, val, after) => {
+            // 正则改写静态标签
+            bodyText = bodyText.replace(/<(a|form|link|img|script|iframe)\s+([^>]*?)(href|action|src)\s*=\s*(['"])(.*?)\4([^>]*?)>/gi, (match, tag, before, attr, quote, val, after) => {
                 if (val && !val.startsWith("data:") && !val.startsWith("javascript:") && !val.startsWith("#")) {
                     try {
                         const newUrl = proxyBase + new URL(val, targetUrl.href).href;
-                        // 组装新标签并移除安全校验
                         let newTag = `<${tag} ${before}${attr}=${quote}${newUrl}${quote}${after}>`;
                         newTag = newTag.replace(/integrity\s*=\s*['"][^'"]*['"]/gi, '');
                         newTag = newTag.replace(/nonce\s*=\s*['"][^'"]*['"]/gi, '');
@@ -228,7 +256,7 @@ export default async function handler(request) {
     }
 }
 
-// ================= UI 组件保持原样 =================
+// ================= UI 组件 =================
 function getIndexUI(linksData) {
     return `
 <!DOCTYPE html>
